@@ -1,0 +1,16 @@
+tick_rate = 60
+
+[web]
+enabled = true
+address = "0.0.0.0:4000"
+
+[connection]
+type = "relay"
+websocket = false
+auto-select-host = "Nubbins AU Demo"
+
+[plugins.MyEvent]
+chance = 1
+
+[plugins.MyEvent2]
+chance = 2
