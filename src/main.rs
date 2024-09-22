@@ -1,86 +1,120 @@
-mod cli;
-mod config;
-mod ecs;
+use insim::{identifiers::RequestId, insim::IsiFlags, Packet, WithRequestId};
+use tokio::time::sleep;
+use tracing_subscriber::filter::EnvFilter;
+
+mod collections;
 mod web;
+mod world;
 
-mod plugins;
+use std::{
+    net::{SocketAddr, ToSocketAddrs},
+    path::PathBuf,
+    thread,
+    time::Duration,
+};
+use tower_http::{services::ServeDir, trace::TraceLayer};
 
-pub type Result<T, E = Report> = color_eyre::Result<T, E>;
-// A generic error report
-// Produced via `Err(some_err).wrap_err("Some context")`
-// or `Err(color_eyre::eyre::Report::new(SomeError))`
-pub struct Report(color_eyre::Report);
+async fn insim_runner(tx: flume::Sender<::insim::Packet>) -> anyhow::Result<()> {
+    let mut attempts = 0_u64;
 
-impl std::fmt::Debug for Report {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.0.fmt(f)
-    }
-}
+    'outer: loop {
+        attempts = attempts.wrapping_add(1);
 
-impl<E> From<E> for Report
-where
-    E: Into<color_eyre::Report>,
-{
-    fn from(err: E) -> Self {
-        Self(err.into())
-    }
-}
+        if attempts >= 2 {
+            break;
+        }
 
-use clap::Parser;
-use cli::Cli;
-use config::Config;
-use std::{io::IsTerminal, path::Path, process::ExitCode, time::Duration};
-use tokio::time;
+        sleep(Duration::from_secs(attempts)).await;
 
-#[tokio::main]
-async fn main() -> Result<ExitCode> {
-    color_eyre::config::HookBuilder::default()
-        .theme(if !std::io::stderr().is_terminal() {
-            // Don't attempt color
-            color_eyre::config::Theme::new()
-        } else {
-            color_eyre::config::Theme::dark()
-        })
-        .install()?;
+        let mut c = match ::insim::tcp("172.24.64.1:29999".parse::<SocketAddr>().unwrap())
+            // let mut c = match ::insim::relay()
+            // .relay_select_host(Some("Nubbins AU Demo".into()))
+            .isi_flags(IsiFlags::MCI)
+            .isi_interval(Duration::from_secs(1))
+            .connect_async()
+            .await
+        {
+            Ok(c) => {
+                attempts = 0;
+                c
+            }
+            Err(e) => {
+                tracing::warn!("{:?}", e);
+                continue;
+            }
+        };
 
-    let cli = Cli::parse();
-    cli.instrumentation.setup()?;
+        c.write(insim::insim::TinyType::Sst.with_request_id(RequestId(1)))
+            .await?;
+        c.write(insim::insim::TinyType::Ncn.with_request_id(RequestId(1)))
+            .await?;
+        c.write(insim::insim::TinyType::Npl.with_request_id(RequestId(1)))
+            .await?;
+        c.write(insim::insim::TinyType::Rst.with_request_id(RequestId(1)))
+            .await?;
+        c.write(insim::insim::TinyType::Res.with_request_id(RequestId(1)))
+            .await?;
+        c.write(insim::insim::TinyType::Reo.with_request_id(RequestId(1)))
+            .await?;
 
-    let config = Config::try_parse(Path::new(&cli.config))?;
-
-    if config.web.enabled {
-        web::start(&config.web);
-    }
-
-    let mut world = ecs::Ecs::new();
-    world.add_plugin(plugins::insim::Plugin {
-        config: config.connection.clone(),
-    });
-
-    println!("{:?}", &config.plugins);
-
-    //world.add_plugin(plugins::random::Plugin);
-
-    world.add_system(ecs::Tick, plugins::insim::print_insim_events);
-    world.startup();
-
-    let mut tick = time::interval(Duration::from_millis(1000 / config.tick_rate));
-
-    loop {
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
-                tracing::info!("Requesting shutdown");
-                break;
-            },
-
-            _ = tick.tick() => {
-                world.tick();
-            },
-
+        loop {
+            match c.read().await {
+                Ok(packet) => {
+                    tx.send(packet)?;
+                }
+                Err(e) => {
+                    tracing::warn!("{:?}", e);
+                    continue 'outer;
+                }
+            }
         }
     }
 
-    world.shutdown();
+    Ok(())
+}
 
-    Ok(ExitCode::SUCCESS)
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::from_default_env().add_directive("echo=trace".parse()?))
+        .init();
+
+    let (tx, rx) = flume::unbounded();
+    let mut w = world::World::new(rx);
+
+    let state = w.state.clone();
+
+    thread::spawn(move || {
+        w.run().unwrap();
+    });
+
+    let runner = tokio::spawn(insim_runner(tx));
+
+    let assets_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets");
+    let static_files_service = ServeDir::new(assets_dir).append_index_html_on_directories(true);
+
+    let app = axum::Router::new()
+        .fallback_service(static_files_service)
+        .route("/live", axum::routing::get(web::live))
+        .with_state(state);
+
+    // run our app with hyper, listening globally on port 3000
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await?;
+
+    tokio::select! {
+        ctrl_c = tokio::signal::ctrl_c() => {
+            ctrl_c?;
+        },
+        res = axum::serve(listener, app) => {
+            res?;
+        },
+        // res = w.run() => {
+        //     res?;
+        // },
+        res = runner => {
+            res??;
+        }
+    }
+
+    Ok(())
 }
