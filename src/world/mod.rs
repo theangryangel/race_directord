@@ -1,15 +1,9 @@
 use std::{
-    collections::VecDeque,
-    sync::Arc,
-    thread::sleep,
-    time::{Duration, Instant},
+    sync::{Arc, Mutex}, thread::sleep, time::{Duration, Instant}
 };
+use itertools::Itertools as _;
 
-use chat::ChatMessage;
-use insim::identifiers::PlayerId;
-use itertools::Itertools;
-use parking_lot::RwLock;
-use player::GapKind;
+use chat::ChatHistory;
 
 pub mod chat;
 pub mod connection;
@@ -17,26 +11,41 @@ pub mod player;
 pub mod race_result;
 pub mod state;
 
-pub type WorldState = Arc<state::State>;
+pub type WorldState = Arc<Mutex<state::State>>;
+pub type ChatState = Arc<Mutex<ChatHistory>>;
+
+pub enum WorldChangeKind {
+    Chat,
+    State,
+}
 
 pub struct World {
     pub target_frame_time: Duration,
     pub last_tick: Instant,
     pub rx: flume::Receiver<insim::Packet>,
     pub state: WorldState,
+    pub chat: ChatState,
     pub exit: bool,
+
+    notifier: flume::Sender<WorldChangeKind>,
 }
 
 impl World {
-    pub(crate) fn new(rx: flume::Receiver<insim::Packet>) -> Self {
+    pub(crate) fn new(
+        rx: flume::Receiver<insim::Packet>,
+        tx: flume::Sender<WorldChangeKind>,
+    ) -> Self {
         let state = WorldState::default();
+        let chat = ChatState::default();
 
         Self {
             target_frame_time: Duration::from_secs_f32(1.0 / 60.0),
             last_tick: Instant::now(),
             rx,
             state,
+            chat,
             exit: false,
+            notifier: tx
         }
     }
 
@@ -69,7 +78,12 @@ impl World {
         loop {
             match self.rx.try_recv() {
                 Ok(p) => {
-                    self.state.update(&p);
+                    if self.state.lock().unwrap().update(&p) {
+                        let _ = self.notifier.send(WorldChangeKind::Chat);
+                    }
+                    if self.chat.lock().unwrap().update(&p) {
+                        let _ = self.notifier.send(WorldChangeKind::State);
+                    }
                 }
                 Err(flume::TryRecvError::Empty) => break,
                 Err(e) => return Err(e.into()),
@@ -89,8 +103,9 @@ impl World {
 
             for player in self
                 .state
+                .lock()
+                .unwrap()
                 .players
-                .read()
                 .iter()
                 .filter(|p| p.1.position > 0)
                 .sorted_by(|a, b| Ord::cmp(&a.1.position, &b.1.position))

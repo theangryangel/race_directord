@@ -14,19 +14,27 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::world::WorldState;
+use crate::world::{ChatState, WorldChangeKind, WorldState};
 
-// basic handler that responds with a static string
-pub(crate) async fn root(State(state): State<WorldState>) -> String {
-    serde_json::to_string(&(*state)).unwrap()
+#[derive(Debug, Clone)]
+pub(crate) struct WebState {
+    pub world: WorldState,
+    pub chat: ChatState,
+    pub changes: flume::Receiver<WorldChangeKind>,
 }
 
 pub(crate) async fn live(
-    State(state): State<WorldState>,
+    State(state): State<WebState>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    let stream = stream::repeat_with(move || Event::default().json_data(&(*state)).unwrap())
-        .map(Ok)
-        .throttle(Duration::from_secs(1));
+
+    let stream = async_stream::stream! {
+        while let Ok(kind) = state.changes.recv_async().await { 
+            yield match kind {
+                WorldChangeKind::Chat => Ok(Event::default().event("game").json_data(&(*state.world.lock().unwrap())).unwrap()),
+                WorldChangeKind::State => Ok(Event::default().event("chat").json_data(&(*state.chat.lock().unwrap())).unwrap()),
+            }
+        }
+    };
 
     Sse::new(stream).keep_alive(
         axum::response::sse::KeepAlive::new()

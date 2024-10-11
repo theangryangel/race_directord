@@ -1,17 +1,12 @@
-use std::collections::{BTreeMap, VecDeque};
 use std::time::Duration;
 
-use if_chain::if_chain;
 use insim::core::track::Track;
 use insim::identifiers::{ConnectionId, PlayerId};
-use itertools::Itertools;
-use parking_lot::RwLock;
 use serde::Serialize;
 
 use crate::collections::NoHashMap;
 use crate::world::player::GapKind;
 
-use super::chat::{ChatMessage, ChatMessageKind};
 use super::connection::Connection;
 use super::player::{Lap, Player, Split};
 use super::race_result::RaceResult;
@@ -29,21 +24,20 @@ pub enum Game {
 
 #[derive(Debug, Default, Serialize)]
 pub struct State {
-    pub players: RwLock<NoHashMap<PlayerId, Player>>,
-    connections: RwLock<NoHashMap<ConnectionId, Connection>>,
+    pub players: NoHashMap<PlayerId, Player>,
+    connections: NoHashMap<ConnectionId, Connection>,
 
-    player_to_connection: RwLock<NoHashMap<PlayerId, ConnectionId>>,
-    connection_to_player: RwLock<NoHashMap<ConnectionId, PlayerId>>,
+    player_to_connection: NoHashMap<PlayerId, ConnectionId>,
+    connection_to_player: NoHashMap<ConnectionId, PlayerId>,
 
-    results: RwLock<NoHashMap<u8, RaceResult>>,
+    results: NoHashMap<u8, RaceResult>,
 
-    game: RwLock<Game>,
-
-    chat: RwLock<VecDeque<ChatMessage>>,
+    game: Game,
 }
 
 impl State {
-    pub fn update(&self, packet: &insim::Packet) {
+    pub fn update(&mut self, packet: &insim::Packet) -> bool {
+        // FIXME: change the returns on the following to be more sensible
         match packet {
             insim::Packet::Ncn(ncn) => self.ncn(ncn),
             insim::Packet::Cnl(cnl) => self.cnl(cnl),
@@ -61,14 +55,13 @@ impl State {
             insim::Packet::Rst(rst) => self.rst(rst),
             insim::Packet::Sta(sta) => self.sta(sta),
             insim::Packet::Tiny(tiny) => self.tiny(tiny),
-            insim::Packet::Mso(mso) => self.mso(mso),
             insim::Packet::Reo(reo) => self.reo(reo),
-            _ => {}
+            _ => { false }
         }
     }
 
-    pub fn npl(&self, npl: &insim::insim::Npl) {
-        self.players.write().insert(
+    pub fn npl(&mut self, npl: &insim::insim::Npl) -> bool {
+        self.players.insert(
             npl.plid,
             Player {
                 name: npl.pname.clone(),
@@ -77,40 +70,50 @@ impl State {
             },
         );
 
-        self.player_to_connection.write().insert(npl.plid, npl.ucid);
-        self.connection_to_player.write().insert(npl.ucid, npl.plid);
+        self.player_to_connection.insert(npl.plid, npl.ucid);
+        self.connection_to_player.insert(npl.ucid, npl.plid);
+
+        true
     }
 
-    pub fn ncn(&self, ncn: &insim::insim::Ncn) {
-        self.connections.write().insert(
+    pub fn ncn(&mut self, ncn: &insim::insim::Ncn) -> bool {
+        self.connections.insert(
             ncn.ucid,
             Connection {
                 uname: ncn.uname.clone(),
                 pname: ncn.pname.clone(),
             },
         );
+
+        true
     }
 
-    pub fn cnl(&self, cnl: &insim::insim::Cnl) {
-        self.connections.write().remove(&cnl.ucid);
+    pub fn cnl(&mut self, cnl: &insim::insim::Cnl) -> bool {
+        self.connections.remove(&cnl.ucid);
         // ensure that we clean up the relative lookup tables
         // this shouldnt occur as LFS should have told us about the player leaving ahead of time
-        if let Some(old_player) = self.connection_to_player.write().remove(&cnl.ucid) {
-            self.players.write().remove(&old_player);
-            self.player_to_connection.write().remove(&old_player);
+        if let Some(old_player) = self.connection_to_player.remove(&cnl.ucid) {
+            self.players.remove(&old_player);
+            self.player_to_connection.remove(&old_player);
+
+            true
+        } else {
+            false
         }
     }
 
-    pub fn pll(&self, pll: &insim::insim::Pll) {
-        self.players.write().remove(&pll.plid);
+    pub fn pll(&mut self, pll: &insim::insim::Pll) -> bool {
+        self.players.remove(&pll.plid);
 
-        if let Some(ucid) = self.player_to_connection.write().remove(&pll.plid) {
-            self.connection_to_player.write().remove(&ucid);
+        if let Some(ucid) = self.player_to_connection.remove(&pll.plid) {
+            self.connection_to_player.remove(&ucid);
         }
+
+        true
     }
 
-    pub fn lap(&self, lap: &insim::insim::Lap) {
-        if let Some(entry) = self.players.write().get_mut(&lap.plid) {
+    pub fn lap(&mut self, lap: &insim::insim::Lap) -> bool {
+        if let Some(entry) = self.players.get_mut(&lap.plid) {
             entry.current_lap = lap.lapsdone + 1;
 
             entry.laps.insert(
@@ -122,32 +125,43 @@ impl State {
                 },
             );
 
-            self.recompute_gap(&lap.plid, entry.current_lap, 4, lap.etime);
+            let current_lap = entry.current_lap.clone();
+            self.recompute_gap(&lap.plid, current_lap, 4_u8, lap.etime);
+
+            return true;
         }
+
+        false
     }
 
-    pub fn mci(&self, mci: &insim::insim::Mci) {
+    pub fn mci(&mut self, mci: &insim::insim::Mci) -> bool {
         for info in mci.info.iter() {
-            if let Some(entry) = self.players.write().get_mut(&info.plid) {
+            if let Some(entry) = self.players.get_mut(&info.plid) {
                 entry.xyz = Some(info.xyz);
                 entry.position = info.position;
             }
         }
+
+        true
     }
 
-    pub fn plp(&self, plp: &insim::insim::Plp) {
-        if let Some(entry) = self.players.write().get_mut(&plp.plid) {
+    pub fn plp(&mut self, plp: &insim::insim::Plp) -> bool {
+        if let Some(entry) = self.players.get_mut(&plp.plid) {
             entry.laps.clear();
             entry.splits.clear();
             entry.pit_stops.clear();
             entry.in_pit_lane = false;
             entry.current_lap = 0;
             entry.xyz = None;
+
+            return true;
         }
+
+        false
     }
 
-    pub fn pla(&self, pla: &insim::insim::Pla) {
-        if let Some(entry) = self.players.write().get_mut(&pla.plid) {
+    pub fn pla(&mut self, pla: &insim::insim::Pla) -> bool {
+        if let Some(entry) = self.players.get_mut(&pla.plid) {
             if pla.entered_pitlane() {
                 entry.in_pit_lane = true;
             }
@@ -155,12 +169,16 @@ impl State {
             if pla.exited_pitlane() {
                 entry.in_pit_lane = false;
             }
+
+            return true;
         }
+
+        false
     }
 
-    pub fn spx(&self, spx: &insim::insim::Spx) {
+    pub fn spx(&mut self, spx: &insim::insim::Spx) -> bool {
         // TODO: if_chain!
-        if let Some(ref mut entry) = &mut self.players.write().get_mut(&spx.plid) {
+        if let Some(ref mut entry) = self.players.get_mut(&spx.plid) {
             if entry.current_lap > 0 {
                 entry.splits.insert(
                     (entry.current_lap, spx.split),
@@ -174,15 +192,20 @@ impl State {
 
             if entry.position <= 1 {
                 entry.gap = None;
-                return;
+                return true;
             }
-            self.recompute_gap(&spx.plid, entry.current_lap, spx.split, spx.etime);
+            let current_lap = entry.current_lap.clone();
+            self.recompute_gap(&spx.plid, current_lap, spx.split, spx.etime);
+
+            return true;
         }
+
+        return false;
     }
 
-    pub fn recompute_gap(&self, current_player: &PlayerId, lap: u16, split: u8, etime: Duration) {
+    pub fn recompute_gap(&mut self, current_player: &PlayerId, lap: u16, split: u8, etime: Duration) {
         let seek = {
-            if let Some(ref mut entry) = &mut self.players.write().get_mut(current_player) {
+            if let Some(ref mut entry) = self.players.get_mut(current_player) {
                 if entry.position <= 1 {
                     entry.gap = None;
                     return;
@@ -194,7 +217,7 @@ impl State {
         };
 
         let gap = {
-            if let Some(ahead_player) = self.players.read().iter().find_map(|p| {
+            if let Some(ahead_player) = self.players.iter().find_map(|p| {
                 if p.1.position == seek {
                     Some(p.1)
                 } else {
@@ -219,47 +242,53 @@ impl State {
             }
         };
 
-        if let Some(ref mut entry) = &mut self.players.write().get_mut(&current_player) {
+        if let Some(ref mut entry) = self.players.get_mut(&current_player) {
             entry.gap = gap;
         }
     }
 
-    pub fn psf(&self, psf: &insim::insim::Psf) {
-        if let Some(entry) = self.players.write().get_mut(&psf.plid) {
+    pub fn psf(&mut self, psf: &insim::insim::Psf) -> bool {
+        if let Some(entry) = self.players.get_mut(&psf.plid) {
             if entry.current_lap > 0 {
                 let current = entry.current_lap;
 
                 entry.pit_stops.insert(current, psf.stime);
             }
+
+            return true;
         }
+
+        false
     }
 
-    pub fn toc(&self, toc: &insim::insim::Toc) {
+    pub fn toc(&mut self, toc: &insim::insim::Toc) -> bool {
         self.player_to_connection
-            .write()
             .insert(toc.plid, toc.newucid);
-        self.connection_to_player.write().remove(&toc.olducid);
+        self.connection_to_player.remove(&toc.olducid);
         self.connection_to_player
-            .write()
             .insert(toc.newucid, toc.plid);
+
+        true
     }
 
-    pub fn cpr(&self, cpr: &insim::insim::Cpr) {
-        if let Some(connection) = self.connections.write().get_mut(&cpr.ucid) {
+    pub fn cpr(&mut self, cpr: &insim::insim::Cpr) -> bool {
+        if let Some(connection) = self.connections.get_mut(&cpr.ucid) {
             connection.pname = cpr.pname.clone();
         }
 
         // TODO: if_chain!
-        if let Some(plid) = self.connection_to_player.read().get(&cpr.ucid) {
-            if let Some(player) = self.players.write().get_mut(&plid) {
+        if let Some(plid) = self.connection_to_player.get(&cpr.ucid) {
+            if let Some(player) = self.players.get_mut(&plid) {
                 player.name = cpr.pname.clone();
                 player.plate = cpr.plate.clone();
             }
         }
+
+        true
     }
 
-    pub fn res(&self, res: &insim::insim::Res) {
-        self.results.write().insert(
+    pub fn res(&mut self, res: &insim::insim::Res) -> bool {
+        self.results.insert(
             res.resultnum,
             RaceResult {
                 uname: res.uname.clone(),
@@ -270,18 +299,20 @@ impl State {
                 pit_stops: res.numstops as u16,
             },
         );
+
+        true
     }
 
-    pub fn rst(&self, rst: &insim::insim::Rst) {
+    pub fn rst(&mut self, rst: &insim::insim::Rst) -> bool {
         if rst.flags.is_cruise() {
-            *self.game.write() = Game::Cruise(rst.track.clone());
-            return;
+            self.game = Game::Cruise(rst.track.clone());
+            return true;
         }
 
         if rst.qualmins > 0 {
-            *self.game.write() =
+            self.game =
                 Game::Qualifying(rst.track.clone(), Duration::from_secs(rst.qualmins as u64));
-            return;
+            return true;
         }
 
         let stage = match rst.racelaps {
@@ -292,58 +323,45 @@ impl State {
             _ => Game::Practise(rst.track.clone()),
         };
 
-        *self.game.write() = stage;
+        self.game = stage;
 
-        for (_key, ele) in self.players.write().iter_mut() {
+        for (_key, ele) in self.players.iter_mut() {
             ele.splits.clear();
             ele.laps.clear();
             ele.current_lap = 1;
             ele.gap = None;
         }
+
+        true
     }
 
-    pub fn sta(&self, sta: &insim::insim::Sta) {
+    pub fn sta(&mut self, sta: &insim::insim::Sta) -> bool {
         if !sta.flags.is_in_game() {
-            *self.game.write() = Game::None;
+            self.game = Game::None;
+            true
+        } else {
+            false
         }
     }
 
-    pub fn tiny(&self, tiny: &insim::insim::Tiny) {
+    pub fn tiny(&mut self, tiny: &insim::insim::Tiny) -> bool {
         if tiny.subt == insim::insim::TinyType::Ren {
-            *self.game.write() = Game::None;
+            self.game = Game::None;
+            return true;
         }
+
+        false
     }
 
-    pub fn mso(&self, mso: &insim::insim::Mso) {
-        if mso.msg.len() <= 0 {
-            return;
-        }
-
-        if let Some(connection) = self.connections.read().get(&mso.ucid) {
-            let mut chat = self.chat.write();
-            if chat.len() >= 20 {
-                chat.pop_back();
-            }
-
-            let kind = if *mso.ucid == 0 {
-                ChatMessageKind::System
-            } else {
-                ChatMessageKind::Player(connection.uname.to_owned())
-            };
-
-            let msg = insim::core::string::colours::strip(&mso.msg).into_owned();
-
-            let _ = chat.push_front(ChatMessage { kind, msg });
-        }
-    }
-
-    pub fn reo(&self, reo: &insim::insim::Reo) {
+    pub fn reo(&mut self, reo: &insim::insim::Reo) -> bool {
         for (idx, plid) in reo.plid.iter().enumerate() {
-            if let Some(entry) = self.players.write().get_mut(plid) {
+            if let Some(entry) = self.players.get_mut(plid) {
                 entry.current_lap = 1;
                 entry.position = (idx + 1) as u8;
             }
         }
+
+        true
     }
 
     // pub fn recompute_gaps(&self, i: &usize) {

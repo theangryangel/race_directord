@@ -1,18 +1,18 @@
 use insim::{identifiers::RequestId, insim::IsiFlags, Packet, WithRequestId};
 use tokio::time::sleep;
 use tracing_subscriber::filter::EnvFilter;
+use web::WebState;
 
 mod collections;
 mod web;
 mod world;
 
 use std::{
-    net::{SocketAddr, ToSocketAddrs},
     path::PathBuf,
     thread,
     time::Duration,
 };
-use tower_http::{services::ServeDir, trace::TraceLayer};
+use tower_http::services::ServeDir;
 
 async fn insim_runner(tx: flume::Sender<::insim::Packet>) -> anyhow::Result<()> {
     let mut attempts = 0_u64;
@@ -26,9 +26,9 @@ async fn insim_runner(tx: flume::Sender<::insim::Packet>) -> anyhow::Result<()> 
 
         sleep(Duration::from_secs(attempts)).await;
 
-        let mut c = match ::insim::tcp("172.24.64.1:29999".parse::<SocketAddr>().unwrap())
-            // let mut c = match ::insim::relay()
-            // .relay_select_host(Some("Nubbins AU Demo".into()))
+        // let mut c = match ::insim::tcp("172.24.64.1:29999".parse::<SocketAddr>().unwrap())
+        let mut c = match ::insim::relay()
+            .relay_select_host(Some("Nubbins AU Demo".into()))
             .isi_flags(IsiFlags::MCI)
             .isi_interval(Duration::from_secs(1))
             .connect_async()
@@ -80,9 +80,15 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let (tx, rx) = flume::unbounded();
-    let mut w = world::World::new(rx);
+    let (notifier, notifier_rx) = flume::unbounded();
 
-    let state = w.state.clone();
+    let mut w = world::World::new(rx, notifier);
+
+    let state = WebState {
+        world: w.state.clone(),
+        chat: w.chat.clone(),
+        changes: notifier_rx
+    };
 
     thread::spawn(move || {
         w.run().unwrap();
